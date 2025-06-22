@@ -43,15 +43,16 @@ export default function Call() {
         await supabase.from('call_sessions').insert({ id: sessionId, offer: JSON.stringify(offer) });
       }
 
-      supabase
+      const channel = supabase
         .channel('call_' + sessionId)
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'ice_candidates' }, (payload) => {
           const candidate = JSON.parse(payload.new.candidate);
           pc.current.addIceCandidate(new RTCIceCandidate(candidate));
-        })
-        .subscribe();
+        });
 
-      supabase
+      await channel.subscribe();
+
+      const subscription = supabase
         .from('call_sessions')
         .select('*')
         .eq('id', sessionId)
@@ -61,6 +62,10 @@ export default function Call() {
             pc.current.setRemoteDescription(new RTCSessionDescription(JSON.parse(data.answer)));
           }
         });
+
+      return () => {
+        channel.unsubscribe();
+      };
     };
 
     setup();
