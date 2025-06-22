@@ -10,13 +10,26 @@ export default function Call() {
   const { sessionId } = useParams();
   const localVideoRef = useRef();
   const remoteVideoRef = useRef();
-  const pc = useRef(new RTCPeerConnection(configuration));
-  const [isCaller, setIsCaller] = useState(false);
+  const pc = useRef(null);
   const iceQueue = useRef([]);
+  const channelRef = useRef(null);
+  const [isCaller, setIsCaller] = useState(false);
 
   useEffect(() => {
+    let remoteAnswerSet = false;
+    let answerInterval = null;
+
     const setup = async () => {
       try {
+        // Close old pc if exists before creating new one
+        if (pc.current) {
+          pc.current.close();
+          pc.current = null;
+        }
+
+        pc.current = new RTCPeerConnection(configuration);
+
+        // Get user media
         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         localVideoRef.current.srcObject = stream;
         stream.getTracks().forEach(track => pc.current.addTrack(track, stream));
@@ -34,18 +47,21 @@ export default function Call() {
           }
         };
 
-        // 🔍 Attempt to load session
-        const { data: offerRow, error } = await supabase
+        // Check if call session already exists
+        const { data: offerRows, error } = await supabase
           .from('call_sessions')
           .select('*')
           .eq('id', sessionId)
-          .single();
+          .limit(1);
 
         if (error && error.code !== 'PGRST116') {
           console.error('Error fetching session:', error.message, error.code);
         }
 
+        const offerRow = offerRows ? offerRows[0] : null;
+
         if (offerRow) {
+          // Joiner role: set remote offer, create answer
           console.log('[Joiner] Offer found, creating answer...');
           setIsCaller(false);
           await pc.current.setRemoteDescription(new RTCSessionDescription(JSON.parse(offerRow.offer)));
@@ -53,62 +69,86 @@ export default function Call() {
           await pc.current.setLocalDescription(answer);
           await supabase.from('call_sessions').update({ answer: JSON.stringify(answer) }).eq('id', sessionId);
         } else {
+          // Caller role: create offer and new session
           console.log('[Caller] No offer found, creating new session...');
           setIsCaller(true);
           const offer = await pc.current.createOffer();
           await pc.current.setLocalDescription(offer);
-          await supabase.from('call_sessions').insert({ id: sessionId, offer: JSON.stringify(offer) });
+          // Use upsert to handle potential conflicts if session already exists
+          await supabase.from('call_sessions').upsert({ id: sessionId, offer: JSON.stringify(offer) }, { onConflict: 'id' });
         }
 
-        // Subscribe to ICE candidates
-        const channel = supabase
-          .channel(`call_${sessionId}`)
-          .on('postgres_changes', {
-            event: 'INSERT',
-            schema: 'public',
-            table: 'ice_candidates',
-            filter: `session_id=eq.${sessionId}`
-          }, async (payload) => {
-            const candidate = new RTCIceCandidate(JSON.parse(payload.new.candidate));
-            if (pc.current.remoteDescription) {
-              await pc.current.addIceCandidate(candidate);
-            } else {
-              iceQueue.current.push(candidate);
-            }
-          });
+        // Setup Supabase channel subscription once
+        if (!channelRef.current) {
+          channelRef.current = supabase
+            .channel(`call_${sessionId}`)
+            .on('postgres_changes', {
+              event: 'INSERT',
+              schema: 'public',
+              table: 'ice_candidates',
+              filter: `session_id=eq.${sessionId}`
+            }, async (payload) => {
+              const candidate = new RTCIceCandidate(payload.new.candidate);
+              if (pc.current.remoteDescription) {
+                await pc.current.addIceCandidate(candidate);
+              } else {
+                iceQueue.current.push(candidate);
+              }
+            });
+          await channelRef.current.subscribe();
+        }
 
-        await channel.subscribe();
-
-        // Poll for answer if this client is the caller
+        // Caller polls for answer until it arrives, then sets remote description once
         if (!offerRow) {
-          const interval = setInterval(async () => {
+          answerInterval = setInterval(async () => {
             const { data } = await supabase
               .from('call_sessions')
-              .select('*')
+              .select('answer')
               .eq('id', sessionId)
               .single();
 
-            if (data?.answer) {
-              console.log('[Caller] Answer received');
-              await pc.current.setRemoteDescription(new RTCSessionDescription(JSON.parse(data.answer)));
-              while (iceQueue.current.length) {
-                await pc.current.addIceCandidate(iceQueue.current.shift());
+            if (data?.answer && !remoteAnswerSet) {
+              try {
+                if (
+                  pc.current.signalingState === 'stable' ||
+                  pc.current.signalingState === 'have-local-offer'
+                ) {
+                  console.log('[Caller] Answer received');
+                  await pc.current.setRemoteDescription(new RTCSessionDescription(JSON.parse(data.answer)));
+                  remoteAnswerSet = true;
+
+                  // Add queued ICE candidates now
+                  while (iceQueue.current.length) {
+                    await pc.current.addIceCandidate(iceQueue.current.shift());
+                  }
+
+                  clearInterval(answerInterval);
+                }
+              } catch (error) {
+                console.error('[Caller] Error setting remote answer SDP:', error);
               }
-              clearInterval(interval);
             }
           }, 500);
         }
-
-        // Cleanup on unmount
-        return () => {
-          channel.unsubscribe();
-        };
       } catch (err) {
         console.error('[setup error]', err);
       }
     };
 
     setup();
+
+    return () => {
+      if (channelRef.current) {
+        channelRef.current.unsubscribe();
+        channelRef.current = null;
+      }
+      if (answerInterval) clearInterval(answerInterval);
+
+      if (pc.current) {
+        pc.current.close();
+        pc.current = null;
+      }
+    };
   }, [sessionId]);
 
   return (
