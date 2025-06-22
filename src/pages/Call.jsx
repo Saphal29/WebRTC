@@ -12,8 +12,10 @@ export default function Call() {
   const remoteVideoRef = useRef();
   const pc = useRef(null);
   const iceQueue = useRef([]);
+  const localIceQueue = useRef([]);
   const channelRef = useRef(null);
   const [isCaller, setIsCaller] = useState(false);
+  const [sessionEstablished, setSessionEstablished] = useState(false);
 
   useEffect(() => {
     let remoteAnswerSet = false;
@@ -40,18 +42,19 @@ export default function Call() {
 
         pc.current.onicecandidate = async (e) => {
           if (e.candidate) {
-            try {
-              await supabase.from('ice_candidates').insert({
-                session_id: sessionId,
-                candidate: JSON.stringify(e.candidate)
-              });
-            } catch (error) {
-              // Check if the error is a 409 Conflict
-              if (error && error.status === 409) {
-                console.warn('Ignoring duplicate ICE candidate (409 Conflict):', error);
-              } else {
+            if (sessionEstablished) {
+              try {
+                await supabase.from('ice_candidates').insert({
+                  session_id: sessionId,
+                  candidate: JSON.stringify(e.candidate)
+                });
+              } catch (error) {
                 console.error('Error inserting ICE candidate:', error);
               }
+            } else {
+              // Queue local ICE candidates if session is not yet established in DB
+              console.log('Queuing local ICE candidate because session is not yet established.');
+              localIceQueue.current.push(e.candidate);
             }
           }
         };
@@ -77,14 +80,28 @@ export default function Call() {
           const answer = await pc.current.createAnswer();
           await pc.current.setLocalDescription(answer);
           await supabase.from('call_sessions').update({ answer: JSON.stringify(answer) }).eq('id', sessionId);
+          setSessionEstablished(true); // Session established for joiner
         } else {
           // Caller role: create offer and new session
           console.log('[Caller] No offer found, creating new session...');
           setIsCaller(true);
           const offer = await pc.current.createOffer();
           await pc.current.setLocalDescription(offer);
-          // Use upsert to handle potential conflicts if session already exists
           await supabase.from('call_sessions').upsert({ id: sessionId, offer: JSON.stringify(offer) }, { onConflict: 'id' });
+          setSessionEstablished(true); // Session established for caller
+        }
+
+        // Drain the local ICE queue after session is established
+        while (localIceQueue.current.length > 0) {
+          const candidate = localIceQueue.current.shift();
+          try {
+            await supabase.from('ice_candidates').insert({
+              session_id: sessionId,
+              candidate: JSON.stringify(candidate)
+            });
+          } catch (error) {
+            console.error('Error inserting queued local ICE candidate:', error);
+          }
         }
 
         // Setup Supabase channel subscription once
