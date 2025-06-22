@@ -1,9 +1,10 @@
-// src/pages/Call.jsx
 import { useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { supabase } from '../supabaseClient';
 
-const configuration = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+const configuration = {
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+};
 
 export default function Call() {
   const { sessionId } = useParams();
@@ -11,6 +12,7 @@ export default function Call() {
   const remoteVideoRef = useRef();
   const pc = useRef(new RTCPeerConnection(configuration));
   const [isCaller, setIsCaller] = useState(false);
+  const iceQueue = useRef([]); // Queue ICE candidates
 
   useEffect(() => {
     const setup = async () => {
@@ -24,11 +26,18 @@ export default function Call() {
 
       pc.current.onicecandidate = async (e) => {
         if (e.candidate) {
-          await supabase.from('ice_candidates').insert({ session_id: sessionId, candidate: JSON.stringify(e.candidate) });
+          await supabase.from('ice_candidates').insert({
+            session_id: sessionId,
+            candidate: JSON.stringify(e.candidate)
+          });
         }
       };
 
-      const { data: offerRow } = await supabase.from('call_sessions').select('*').eq('id', sessionId).single();
+      const { data: offerRow } = await supabase
+        .from('call_sessions')
+        .select('*')
+        .eq('id', sessionId)
+        .single();
 
       if (offerRow) {
         setIsCaller(false);
@@ -44,24 +53,44 @@ export default function Call() {
       }
 
       const channel = supabase
-        .channel('call_' + sessionId)
-        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'ice_candidates' }, (payload) => {
-          const candidate = JSON.parse(payload.new.candidate);
-          pc.current.addIceCandidate(new RTCIceCandidate(candidate));
+        .channel(`call_${sessionId}`)
+        .on('postgres_changes', {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'ice_candidates',
+          filter: `session_id=eq.${sessionId}`
+        }, async (payload) => {
+          const candidate = new RTCIceCandidate(JSON.parse(payload.new.candidate));
+          if (pc.current.remoteDescription) {
+            await pc.current.addIceCandidate(candidate);
+          } else {
+            iceQueue.current.push(candidate);
+          }
         });
 
       await channel.subscribe();
 
-      const subscription = supabase
-        .from('call_sessions')
-        .select('*')
-        .eq('id', sessionId)
-        .single()
-        .then(({ data }) => {
-          if (!isCaller && data.answer) {
-            pc.current.setRemoteDescription(new RTCSessionDescription(JSON.parse(data.answer)));
+      // Poll for answer if not the caller
+      if (!isCaller) {
+        const interval = setInterval(async () => {
+          const { data } = await supabase
+            .from('call_sessions')
+            .select('*')
+            .eq('id', sessionId)
+            .single();
+
+          if (data?.answer) {
+            await pc.current.setRemoteDescription(new RTCSessionDescription(JSON.parse(data.answer)));
+
+            // Apply any queued ICE candidates
+            while (iceQueue.current.length) {
+              await pc.current.addIceCandidate(iceQueue.current.shift());
+            }
+
+            clearInterval(interval);
           }
-        });
+        }, 500);
+      }
 
       return () => {
         channel.unsubscribe();
