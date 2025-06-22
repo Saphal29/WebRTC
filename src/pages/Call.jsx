@@ -12,89 +12,100 @@ export default function Call() {
   const remoteVideoRef = useRef();
   const pc = useRef(new RTCPeerConnection(configuration));
   const [isCaller, setIsCaller] = useState(false);
-  const iceQueue = useRef([]); // Queue ICE candidates
+  const iceQueue = useRef([]);
 
   useEffect(() => {
     const setup = async () => {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      localVideoRef.current.srcObject = stream;
-      stream.getTracks().forEach(track => pc.current.addTrack(track, stream));
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        localVideoRef.current.srcObject = stream;
+        stream.getTracks().forEach(track => pc.current.addTrack(track, stream));
 
-      pc.current.ontrack = (event) => {
-        remoteVideoRef.current.srcObject = event.streams[0];
-      };
+        pc.current.ontrack = (event) => {
+          remoteVideoRef.current.srcObject = event.streams[0];
+        };
 
-      pc.current.onicecandidate = async (e) => {
-        if (e.candidate) {
-          await supabase.from('ice_candidates').insert({
-            session_id: sessionId,
-            candidate: JSON.stringify(e.candidate)
-          });
+        pc.current.onicecandidate = async (e) => {
+          if (e.candidate) {
+            await supabase.from('ice_candidates').insert({
+              session_id: sessionId,
+              candidate: JSON.stringify(e.candidate)
+            });
+          }
+        };
+
+        // 🔍 Attempt to load session
+        const { data: offerRow, error } = await supabase
+          .from('call_sessions')
+          .select('*')
+          .eq('id', sessionId)
+          .single();
+
+        if (error && error.code !== 'PGRST116') {
+          console.error('Error fetching session:', error.message, error.code);
         }
-      };
 
-      const { data: offerRow } = await supabase
-        .from('call_sessions')
-        .select('*')
-        .eq('id', sessionId)
-        .single();
+        if (offerRow) {
+          console.log('[Joiner] Offer found, creating answer...');
+          setIsCaller(false);
+          await pc.current.setRemoteDescription(new RTCSessionDescription(JSON.parse(offerRow.offer)));
+          const answer = await pc.current.createAnswer();
+          await pc.current.setLocalDescription(answer);
+          await supabase.from('call_sessions').update({ answer: JSON.stringify(answer) }).eq('id', sessionId);
+        } else {
+          console.log('[Caller] No offer found, creating new session...');
+          setIsCaller(true);
+          const offer = await pc.current.createOffer();
+          await pc.current.setLocalDescription(offer);
+          await supabase.from('call_sessions').insert({ id: sessionId, offer: JSON.stringify(offer) });
+        }
 
-      if (offerRow) {
-        setIsCaller(false);
-        await pc.current.setRemoteDescription(new RTCSessionDescription(JSON.parse(offerRow.offer)));
-        const answer = await pc.current.createAnswer();
-        await pc.current.setLocalDescription(answer);
-        await supabase.from('call_sessions').update({ answer: JSON.stringify(answer) }).eq('id', sessionId);
-      } else {
-        setIsCaller(true);
-        const offer = await pc.current.createOffer();
-        await pc.current.setLocalDescription(offer);
-        await supabase.from('call_sessions').insert({ id: sessionId, offer: JSON.stringify(offer) });
-      }
-
-      const channel = supabase
-        .channel(`call_${sessionId}`)
-        .on('postgres_changes', {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'ice_candidates',
-          filter: `session_id=eq.${sessionId}`
-        }, async (payload) => {
-          const candidate = new RTCIceCandidate(JSON.parse(payload.new.candidate));
-          if (pc.current.remoteDescription) {
-            await pc.current.addIceCandidate(candidate);
-          } else {
-            iceQueue.current.push(candidate);
-          }
-        });
-
-      await channel.subscribe();
-
-      // Poll for answer if not the caller
-      if (!isCaller) {
-        const interval = setInterval(async () => {
-          const { data } = await supabase
-            .from('call_sessions')
-            .select('*')
-            .eq('id', sessionId)
-            .single();
-
-          if (data?.answer) {
-            await pc.current.setRemoteDescription(new RTCSessionDescription(JSON.parse(data.answer)));
-
-            // Apply any queued ICE candidates
-            while (iceQueue.current.length) {
-              await pc.current.addIceCandidate(iceQueue.current.shift());
+        // Subscribe to ICE candidates
+        const channel = supabase
+          .channel(`call_${sessionId}`)
+          .on('postgres_changes', {
+            event: 'INSERT',
+            schema: 'public',
+            table: 'ice_candidates',
+            filter: `session_id=eq.${sessionId}`
+          }, async (payload) => {
+            const candidate = new RTCIceCandidate(JSON.parse(payload.new.candidate));
+            if (pc.current.remoteDescription) {
+              await pc.current.addIceCandidate(candidate);
+            } else {
+              iceQueue.current.push(candidate);
             }
+          });
 
-            clearInterval(interval);
-          }
-        }, 500);
+        await channel.subscribe();
+
+        // Poll for answer if this client is the caller
+        if (!offerRow) {
+          const interval = setInterval(async () => {
+            const { data } = await supabase
+              .from('call_sessions')
+              .select('*')
+              .eq('id', sessionId)
+              .single();
+
+            if (data?.answer) {
+              console.log('[Caller] Answer received');
+              await pc.current.setRemoteDescription(new RTCSessionDescription(JSON.parse(data.answer)));
+              while (iceQueue.current.length) {
+                await pc.current.addIceCandidate(iceQueue.current.shift());
+              }
+              clearInterval(interval);
+            }
+          }, 500);
+        }
+
+        // Cleanup on unmount
+        return () => {
+          channel.unsubscribe();
+        };
+      } catch (err) {
+        console.error('[setup error]', err);
       }
-
-      return () => {
-        channel.unsubscribe();
-      };
     };
 
     setup();
