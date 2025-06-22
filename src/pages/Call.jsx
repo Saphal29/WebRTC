@@ -40,10 +40,19 @@ export default function Call() {
 
         pc.current.onicecandidate = async (e) => {
           if (e.candidate) {
-            await supabase.from('ice_candidates').insert({
-              session_id: sessionId,
-              candidate: JSON.stringify(e.candidate)
-            });
+            try {
+              await supabase.from('ice_candidates').insert({
+                session_id: sessionId,
+                candidate: JSON.stringify(e.candidate)
+              });
+            } catch (error) {
+              // Check if the error is a 409 Conflict
+              if (error && error.status === 409) {
+                console.warn('Ignoring duplicate ICE candidate (409 Conflict):', error);
+              } else {
+                console.error('Error inserting ICE candidate:', error);
+              }
+            }
           }
         };
 
