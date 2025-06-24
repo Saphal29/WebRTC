@@ -3,7 +3,7 @@ import { useParams } from 'react-router-dom';
 import { supabase } from '../supabaseClient';
 
 const configuration = {
-  iceServers: [{ urls: [ "stun:bn-turn1.xirsys.com" ]
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302'
 
   }, {
     username: "BhK7h8jJH5QtYa7QyWf322arOW9urwJ0mWxEgG0tEGp3s3M5LAoF_pcPMRS2AXPlAAAAAGha4_VzYXBoYWwyOQ==",
