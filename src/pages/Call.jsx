@@ -3,17 +3,7 @@ import { useParams } from 'react-router-dom';
 import { supabase } from '../supabaseClient';
 
 const configuration = {
-  iceServers: [{ urls: 'stun:stun.l.google.com:19302'
-
-  }, {
-    username: "BhK7h8jJH5QtYa7QyWf322arOW9urwJ0mWxEgG0tEGp3s3M5LAoF_pcPMRS2AXPlAAAAAGha4_VzYXBoYWwyOQ==",
-     credential: "dc66537c-5122-11f0-bbb0-0242ac140004",
-      urls: [ "turn:bn-turn1.xirsys.com:80?transport=udp",
-         "turn:bn-turn1.xirsys.com:3478?transport=udp",
-         "turn:bn-turn1.xirsys.com:80?transport=tcp",
-         "turn:bn-turn1.xirsys.com:3478?transport=tcp",
-         "turns:bn-turn1.xirsys.com:443?transport=tcp",
-         "turns:bn-turn1.xirsys.com:5349?transport=tcp" ]}]
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
 };
 
 export default function Call() {
